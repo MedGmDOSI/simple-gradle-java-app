@@ -1,0 +1,209 @@
+# =====================================================================
+#  Pipeline CI/CD - simple-gradle-java-app
+#
+#  (6) tout commit, toute branche  : build + tests Gradle
+#  (7) commit sur develop          : + image Docker poussée en :latest (avec cache)
+#  (8) tag X.Y.Z sur main          : build from scratch + image :X.Y.Z + release
+#      tag d'une autre forme       : pipeline en échec -> push annulé
+#  (9) notification Discord à la fin de chaque pipeline
+# =====================================================================
+
+workflow:
+  rules:
+    # pas de pipeline en double (branche + MR) : on garde celui de la MR
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - check
+  - build
+  - test
+  - package
+  - release
+  - notify
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  IMAGE: "$CI_REGISTRY_IMAGE"
+
+default:
+  image: eclipse-temurin:11-jdk
+
+# ---------------------------------------------------------------------
+#  Modèles réutilisables
+# ---------------------------------------------------------------------
+.gradle-cache:
+  cache:
+    key: gradle-$CI_COMMIT_REF_SLUG
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+
+.docker:
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      # registry locale en HTTP
+      command: ["--insecure-registry=gitlab.local:5050"]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+.not-a-tag:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
+# ---------------------------------------------------------------------
+#  (6) Build + tests à chaque commit, quelle que soit la branche
+# ---------------------------------------------------------------------
+build:
+  stage: build
+  extends: [.gradle-cache, .not-a-tag]
+  script:
+    - ./gradlew assemble
+  artifacts:
+    paths: [build/]
+    expire_in: 1 day
+
+test:
+  stage: test
+  extends: [.gradle-cache, .not-a-tag]
+  needs: [build]
+  cache:
+    key: gradle-$CI_COMMIT_REF_SLUG
+    paths: [.gradle/wrapper, .gradle/caches]
+    policy: pull
+  script:
+    - ./gradlew test
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/test/TEST-*.xml
+
+# ---------------------------------------------------------------------
+#  (7) develop -> image :latest dans la registry (cache autorisé)
+# ---------------------------------------------------------------------
+docker-latest:
+  stage: package
+  extends: .docker
+  needs: [test]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  script:
+    - docker pull "$IMAGE:latest" || true
+    - >
+      docker build
+      --cache-from "$IMAGE:latest"
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      -t "$IMAGE:latest" .
+    - docker push "$IMAGE:latest"
+
+# ---------------------------------------------------------------------
+#  (8) Tag sur main -> build depuis zéro, image :X.Y.Z, release
+# ---------------------------------------------------------------------
+check-tag:
+  stage: check
+  image: alpine/git:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - |
+      if ! echo "$CI_COMMIT_TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "Tag '$CI_COMMIT_TAG' invalide (format attendu X.Y.Z) : push annulé."
+        exit 1
+      fi
+    - git fetch origin main:refs/remotes/origin/main
+    - |
+      if ! git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then
+        echo "Le tag '$CI_COMMIT_TAG' ne pointe pas sur un commit de main : push annulé."
+        exit 1
+      fi
+    # notes de release = commits depuis le tag X.Y.Z précédent
+    - PREV=$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' "$CI_COMMIT_TAG^" 2>/dev/null || true)
+    - RANGE=${PREV:+$PREV..}$CI_COMMIT_TAG
+    - |
+      {
+        echo "## Version $CI_COMMIT_TAG"
+        echo
+        echo "Image Docker : \`$IMAGE:$CI_COMMIT_TAG\`"
+        echo
+        echo "### Changements ${PREV:+depuis $PREV}"
+        git log --no-merges --pretty='- %s (%h, %an)' "$RANGE"
+      } > release-notes.md
+    - cat release-notes.md
+  artifacts:
+    paths: [release-notes.md]
+
+build-release:
+  stage: build
+  needs: [check-tag]
+  rules:
+    - if: $CI_COMMIT_TAG
+  cache: []            # aucun cache : on repart de 0
+  script:
+    - ./gradlew clean build --refresh-dependencies --no-build-cache
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/test/TEST-*.xml
+
+docker-release:
+  stage: package
+  extends: .docker
+  needs: [build-release]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - docker build --no-cache --pull -t "$IMAGE:$CI_COMMIT_TAG" .
+    - docker push "$IMAGE:$CI_COMMIT_TAG"
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  needs:
+    - job: check-tag
+      artifacts: true
+    - job: docker-release
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Création de la release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Version $CI_COMMIT_TAG"
+    description: ./release-notes.md
+
+# ---------------------------------------------------------------------
+#  (9) Notification Discord (variable CI/CD masquée DISCORD_WEBHOOK_URL)
+#      Les autres événements GitLab (push, MR, issues, tags...) passent par
+#      l'intégration native : Settings > Integrations > Discord Notifications
+# ---------------------------------------------------------------------
+.notify:
+  stage: notify
+  image: curlimages/curl:latest
+  dependencies: []     # pas de needs : on attend la fin des autres stages
+
+notify-success:
+  extends: .notify
+  rules:
+    - if: $DISCORD_WEBHOOK_URL
+      when: on_success
+  script:
+    - 'curl -sS -X POST -H "Content-Type: application/json" -d "{\"username\":\"GitLab CI\",\"content\":\"✅ Pipeline réussi : $CI_PROJECT_PATH @ $CI_COMMIT_REF_NAME ($CI_COMMIT_SHORT_SHA) par $GITLAB_USER_LOGIN\n$CI_PIPELINE_URL\"}" "$DISCORD_WEBHOOK_URL"'
+
+notify-failure:
+  extends: .notify
+  rules:
+    - if: $DISCORD_WEBHOOK_URL
+      when: on_failure
+  script:
+    - 'curl -sS -X POST -H "Content-Type: application/json" -d "{\"username\":\"GitLab CI\",\"content\":\"❌ Pipeline en échec : $CI_PROJECT_PATH @ $CI_COMMIT_REF_NAME ($CI_COMMIT_SHORT_SHA) par $GITLAB_USER_LOGIN\n$CI_PIPELINE_URL\"}" "$DISCORD_WEBHOOK_URL"'

@@ -1,0 +1,154 @@
+# Même pipeline que .gitlab-ci.yml, version GitHub Actions
+#  - tout commit, toute branche : build + tests Gradle
+#  - develop : image ghcr.io/<owner>/<repo>:latest (cache gradle + cache docker gha)
+#  - tag X.Y.Z sur main : build from scratch, image :X.Y.Z, release GitHub
+#  - autre tag : workflow en échec -> push annulé
+#  - notification Discord à la fin
+name: CI-CD
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+
+permissions:
+  contents: write     # création de la release
+  packages: write     # push vers ghcr.io
+
+jobs:
+  # ---------------- build + tests (branches / PR) ----------------
+  build-test:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: gradle            # cache du runner
+      - run: ./gradlew build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: build/reports/tests/test
+
+  docker-latest:
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------- release sur tag ----------------
+  check-tag:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Tag au format X.Y.Z et sur main
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! echo "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '$TAG' invalide (format attendu X.Y.Z) : push annulé."
+            exit 1
+          fi
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Le tag '$TAG' ne pointe pas sur un commit de main : push annulé."
+            exit 1
+          fi
+      - name: Notes de release
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV=$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' "$TAG^" 2>/dev/null || true)
+          {
+            echo "## Version $TAG"
+            echo
+            echo "Image Docker : \`ghcr.io/${GITHUB_REPOSITORY,,}:$TAG\`"
+            echo
+            echo "### Changements ${PREV:+depuis $PREV}"
+            git log --no-merges --pretty='- %s (%h, %an)' "${PREV:+$PREV..}$TAG"
+          } > release-notes.md
+          cat release-notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  build-release:
+    needs: check-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5      # volontairement sans cache
+        with:
+          distribution: temurin
+          java-version: '11'
+      - run: ./gradlew clean build --refresh-dependencies --no-build-cache
+
+  docker-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          no-cache: true
+          pull: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+
+  release:
+    needs: docker-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-notes
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Version $GITHUB_REF_NAME" --notes-file release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------- notification Discord ----------------
+  notify:
+    if: always()
+    needs: [build-test, docker-latest, check-tag, build-release, docker-release, release]
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      STATUS: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && '❌ Workflow en échec' || '✅ Workflow réussi' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Envoi Discord
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "Secret DISCORD_WEBHOOK_URL absent, on saute."; exit 0; fi
+          jq -n --arg c "$STATUS : $GITHUB_REPOSITORY @ $GITHUB_REF_NAME (${GITHUB_SHA::7}) par $GITHUB_ACTOR
+          $RUN_URL" '{username:"GitHub Actions", content:$c}' \
+            | curl -sS -X POST -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
