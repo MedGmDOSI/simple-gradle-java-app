@@ -13,6 +13,12 @@ class AppTest {
        assertEquals(expected,result);
     }
 
+    @Test void getProduct() {
+       assertEquals(20, App.getProduct(4, 5));
+       assertEquals(0, App.getProduct(7, 0));
+       assertEquals(-6, App.getProduct(-2, 3));
+    }
+
     @Test void main(){
         App.main(new String[]{});
     }
