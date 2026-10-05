@@ -1,51 +1,22 @@
-reponses tp git
+reponses tp ci-cd
 
-b. remote en local
-    difference depot local et remote :
-    le depot local est sur notre machine avec les fichiers de travail, on peut coder, tester et commit sans reseau... le remote sert juste de reference pour synchroniser l'equipe, c'est un depot bare sans working directory, juste pour push et pull.   
+2. registry gitlab
+    registry privee :
+    c'est un serveur qui stocke les images docker (nom + tag) mais accessible que par les gens autorises, pas comme docker hub public.
+    l'interet : le code et les images restent prives, les droits sont ceux du projet gitlab, l'image est stockee a cote du code et on sait quel commit a produit quelle version... et en plus c'est en local donc rapide et pas de limite de pull.   
 
-c. creation d'une equipe
-    fichiers a commit et ignorer :
-    on commit les sources dans src/, les scripts gradle (gradlew, build.gradle...), le README et .gitignore.
-    on ignore tout ce qui est genere : le dossier build/, le cache .gradle, et les dossiers d'ide comme .idea ou .vscode pour pas polluer le repo.   
+3. runner en local
+    runner :
+    c'est l'agent qui execute les jobs. gitlab lui ne fait que lire le .gitlab-ci.yml et mettre les jobs en attente, le runner les recupere, clone le repo, lance les scripts dans un conteneur et renvoie les logs, le statut et les artefacts.   
 
-lier DEV1 au remote :
-on fait git remote add origin $REMOTE, et pour envoyer la branche : git push -u origin master.   
+5. .gitlab-ci.yml
+    fichier yml :
+    un format texte pour ecrire de la config, base sur l'indentation (espaces, jamais de tabulations), avec des cle: valeur, des listes avec des tirets... on le retrouve partout (docker compose, kubernetes, github actions...).   
 
-contenu de $REMOTE :
-il n'y a aucun fichier de code visible, juste les dossiers internes de git (objects, refs, HEAD...), c'est normal vu que c'est un repo cree en --bare.   
+a quoi sert .gitlab-ci.yml :
+il est a la racine du repo et decrit tout le pipeline : les stages, les jobs, l'image de chaque job, les commandes, quand ils se lancent (rules), le cache, les artefacts... a chaque push/merge request/tag gitlab le lit et cree le pipeline. vu qu'il est versionne il evolue avec le code.   
 
-d. travail en equipe
-
-4.a git lol :
-on voit pas le commit de DEV1 sur DEV2, git ne synchronise rien tout seul en arriere-plan...   
-
-4.b git fetch :
-origin/master avance d'un commit sur l'arbre, mais notre branche locale master reste a l'ancien commit, les branches sont decalees.   
-
-4.c App.java :
-le code n'a pas bouge (toujours num1+num2), normal car fetch recupere juste les commits dans l'historique sans toucher aux fichiers de travail.   
-
-4.d etape pour finir :
-il faut fusionner avec git merge origin/master, et la ca fait un fast-forward direct.   
-
-6.a git pull vs etape 4 :
-git pull fait les deux d'un coup (le fetch puis le merge direct), sans devoir taper les deux commandes separement.   
-
-e. gestion des conflits
-    conflit sur App.java :
-    le push est rejete car on n'est pas a jour, et le pull met un conflit dans le fichier... parce que DEV1 et DEV2 ont modifie les memes lignes en meme temps.
-    pour resoudre : on ouvre App.java, on supprime les balises <<<<<<< et >>>>>>>, on garde le code qu'on veut, puis git add App.java et git commit pour valider le merge.   
-
-7.b modif @author :
-meme probleme, conflit sur la ligne de l'auteur vu qu'il y a deux noms differents... faut rouvrir le fichier, choisir le bon nom, git add et commit.   
-
-i. a comprendre
-    commit atomique :
-    un commit qui fait une seule tache precise (un bugfix, une petite feature...), court, propre, et qui laisse le projet fonctionnel.   
-
-purger un secret :
-d'abord revoquer le token/mot de passe tout de suite, puis reecrire l'historique avec git-filter-repo (ou bfg) pour le virer de tous les anciens commits, et enfin git push --force.   
-
-prevenir les fuites :
-mettre les cles dans un fichier .env bien liste dans .gitignore, et mettre un hook avec gitleaks ou trufflehog pour bloquer le commit avant de push.
+etapes possibles :
+on les definit nous meme dans stages:, par defaut c'est .pre, build, test, deploy, .post.
+en general : check/lint -> build -> test -> securite/qualite -> package (image docker) -> release -> deploy -> notify.
+les jobs d'un meme stage tournent en parallele, et un stage attend que le precedent soit fini (sauf avec needs:).   
