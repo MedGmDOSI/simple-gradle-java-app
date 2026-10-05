@@ -12,7 +12,12 @@ public class App {
 	return somme;
     }
 
+    public static int getProduct(int num1, int num2) {
+        return num1 * num2;
+    }
+
     public static void main(String[] args) {
             System.out.println("Sum is " + getSum(4,5));
+            System.out.println("Product is " + getProduct(4,5));
     }
 }
